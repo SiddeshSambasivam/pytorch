@@ -210,24 +210,36 @@ def bn2d_inference_rule(n: Node, module_instance):
         raise TypeError(f'Cannot apply {module_instance} with input type {arg_type} and existing type {n.type} on {n}')
 
 def calculate_hout(h_in, op_type):
+
+    padding = (op_type.padding, op_type.padding) if isinstance(op_type.padding, int) else op_type.padding
+    kernel_size = (op_type.kernel_size, op_type.kernel_size) if isinstance(op_type.kernel_size, int) else op_type.kernel_size
+    stride = (op_type.stride, op_type.stride) if isinstance(op_type.stride, int) else op_type.stride
+    dilation = (op_type.dilation, op_type.dilation) if isinstance(op_type.dilation, int) else op_type.dilation
+
+
     if h_in == Dyn:
         return Dyn
 
     elif isinstance(h_in, int):
-        h_out = floor((h_in + (2 * op_type.padding[0] - op_type.dilation[0] *
-                               (op_type.kernel_size[0] - 1) - 1)) / op_type.stride[0]) + 1
+        h_out = floor((h_in + (2 * padding[0] - dilation[0] *
+                               (kernel_size[0] - 1) - 1)) / stride[0]) + 1
         return h_out
     else:
         raise TypeError(f'{h_in} must be a number or Dyn')
 
 def calculate_wout(w_in, op_type):
+    padding = (op_type.padding, op_type.padding) if isinstance(op_type.padding, int) else op_type.padding
+    kernel_size = (op_type.kernel_size, op_type.kernel_size) if isinstance(op_type.kernel_size, int) else op_type.kernel_size
+    stride = (op_type.stride, op_type.stride) if isinstance(op_type.stride, int) else op_type.stride
+    dilation = (op_type.dilation, op_type.dilation) if isinstance(op_type.dilation, int) else op_type.dilation
+
     if w_in == Dyn:
         return Dyn
 
     elif isinstance(w_in, int):
-        w_out = floor((w_in + (2 * op_type.padding[1] - op_type.dilation[1] *
-                               (op_type.kernel_size[1] - 1) - 1)) /
-                      op_type.stride[1]) + 1
+        w_out = floor((w_in + (2 * padding[1] - dilation[1] *
+                               (kernel_size[1] - 1) - 1)) /
+                      stride[1]) + 1
         return w_out
     else:
         raise TypeError(f'{w_in} in {op_type} must be a number or Dyn')
@@ -249,6 +261,8 @@ def conv2d_inference_rule(n: Node, op_type):
 
         w_out = calculate_wout(w_in, op_type)
 
+        # todo backwards propagation
+
         new_type = TensorType((arg_type.__args__[0], op_type.out_channels, h_out, w_out))
         n.type = new_type
 
@@ -267,6 +281,50 @@ def relu_inference_rule(n: Node, op_type):
         return n.type
     else:
         raise TypeError(f'Cannot apply {op_type}. Current shape {n.type} does not match argument shape {arg_type}')
+
+
+def maxpool2d_check(typ, op_type):
+    new_type_list = list(typ.__args__)
+    if len(new_type_list) == 4 or len(new_type_list) == 3:
+        w_in = new_type_list[-1]
+        h_in = new_type_list[-2]
+        h_out = calculate_hout(h_in, op_type)
+        w_out = calculate_wout(w_in, op_type)
+        new_type_list[-1] = w_out
+        new_type_list[-2] = h_out
+        return TensorType(tuple(new_type_list))
+
+    else:
+        raise TypeError(f'Wrong size {typ} for {op_type}')
+
+
+@register_inference_rule(torch.nn.MaxPool2d)
+def maxpool2d_inference_rule(n: Node, op_type):
+    assert isinstance(n.args[0], Node)
+
+    if n.args[0].type == Dyn and n.type == Dyn:
+        return Dyn
+
+    # Todo backwards propagation
+    elif n.args[0].type == Dyn and isinstance(n.type, TensorType):
+        n.type = maxpool2d_check(n.type, op_type)
+        return n.type
+
+    elif n.type == Dyn and isinstance(n.args[0].type, TensorType):
+        n.type = maxpool2d_check(n.args[0].type, op_type)
+        return n.type
+
+    elif isinstance(n.args[0].type, TensorType) and isinstance(n.type, TensorType):
+        new_arg = maxpool2d_check(n.args[0].type, op_type)
+        new_node_type = maxpool2d_check(n.type, op_type)
+
+        n.type = new_node_type
+
+        if is_more_precise(new_arg, n.type):
+            n.type = new_arg
+        return n.type
+    else:
+        raise TypeError(f'Cannot apply {op_type} with input type {n.args[0].type} and existing type {n.type} on {n}')
 
 
 class GraphTypeChecker:
