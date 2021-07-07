@@ -16,7 +16,6 @@ from torch.optim import Optimizer
 
 __all__ = ["ZeroRedundancyOptimizer"]
 
-
 # Credits:  classy_vision/generic/distributed_util.py
 def _recursive_copy_to_device(
     value: Any,
@@ -52,46 +51,6 @@ def _is_trainable(param: torch.Tensor) -> bool:
     requiring a gradient.
     """
     return param.requires_grad
-
-
-def _broadcast_object(
-    obj: Any, src_rank: int,
-    group: object = dist.group.WORLD,
-    device: torch.device = torch.device("cpu")
-) -> Any:
-    r"""
-    Broadcasts an object to the given group, sending the object if called from
-    the source rank and receiving the object otherwise.
-
-    Arguments:
-        obj: object to broadcast; only used if called on the source rank.
-        src_rank (int): source rank.
-        group (``ProcessGroup``, optional): group used for the broadcast
-            (default: ``dist.group.WORLD``).
-        device (``torch.device``, optional): device to send from or receive
-            to (default: ``torch.device("cpu")``).
-
-    Returns:
-        The broadcasted object.
-    """
-    if dist.get_rank() == src_rank:
-        # Send the object
-        buffer = io.BytesIO()
-        torch.save(obj, buffer)
-        data = bytearray(buffer.getbuffer())
-        length_tensor = torch.LongTensor([len(data)]).to(device)
-        data_send_tensor = torch.ByteTensor(data).to(device)
-        dist.broadcast(length_tensor, src=src_rank, group=group, async_op=False)
-        dist.broadcast(data_send_tensor, src=src_rank, group=group, async_op=False)
-    else:
-        # Receive the object
-        length_tensor = torch.LongTensor([0]).to(device)
-        dist.broadcast(length_tensor, src=src_rank, group=group, async_op=False)
-        data_recv_tensor = torch.empty([int(length_tensor.item())], dtype=torch.uint8, device=device)
-        dist.broadcast(data_recv_tensor, src=src_rank, group=group, async_op=False)
-        buffer = io.BytesIO(data_recv_tensor.cpu().numpy())
-        obj = torch.load(buffer, map_location=device)
-    return obj
 
 
 def _get_global_rank(group: Any, rank: int) -> int:
@@ -279,9 +238,6 @@ class ZeroRedundancyOptimizer(Optimizer):
         # case they have been updated
         self._sync_param_groups(self.param_groups, self.optim.param_groups)
 
-        # Pull the sharded state from all ranks and store them in rank order
-        empty_messenger = torch.tensor([0], dtype=torch.uint8, device=self._default_device)
-
         # NOTE: We wastefully use `broadcast()` (e.g. instead of `gather()`)
         # due to compatibility issues with NCCL backend; a possible follow-up
         # is to move all sharded state management to RPC RRef
@@ -298,32 +254,33 @@ class ZeroRedundancyOptimizer(Optimizer):
                     )
                 else:
                     # Receive the optimizer state from the source rank
-                    local_state_dict = _broadcast_object(
-                        empty_messenger,
+                    object_list = [None]
+                    dist.broadcast_object_list(
+                        object_list,
                         src_rank=global_rank,
                         group=self.group,
-                        device=self._default_device,
+                        dist_device=self._default_device,
                     )
                     self._all_state_dicts.append(
-                        _recursive_copy_to_device(local_state_dict, non_blocking=True, device=torch.device("cpu"))
+                        _recursive_copy_to_device(object_list[0], non_blocking=True, device=torch.device("cpu"))
                     )
             else:
                 if rank == self.rank:
                     # Send the optimizer state to the target rank
-                    _ = _broadcast_object(
-                        self.optim.state_dict(),
+                    _ = dist.broadcast_object_list(
+                        [self.optim.state_dict()],
                         src_rank=self.global_rank,
                         group=self.group,
-                        device=self._default_device,
+                        dist_device=self._default_device,
                     )
                 elif rank != to:
                     # Discard the received object; `broadcast()` is used for
                     # compatibility reasons
-                    _ = _broadcast_object(
-                        empty_messenger,
+                    _ = dist.broadcast_object_list(
+                        [None],
                         src_rank=global_rank,
                         group=self.group,
-                        device=self._default_device,
+                        dist_device=self._default_device,
                     )
 
     def _partition_parameters(self) -> List[List[Dict]]:
